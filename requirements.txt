@@ -1,0 +1,10 @@
+streamlit
+pandas
+psycopg2-binary
+openpyxl
+python-dotenv
+google-cloud-vision
+opencv-python-headless
+Pillow
+numpy
+rapidfuzz
