@@ -363,33 +363,35 @@ with tab_count:
         key="ocr_count"
     )
 
-    # إعداد باراميترات الأداء
-    colA, colB = st.columns(2)
-    with colA:
-        bs = st.number_input("حجم الدُفعة (Batch Size)", min_value=1, max_value=32, value=16, step=1)
-    with colB:
-        workers = st.number_input("عدد العمال المتوازيين (Threads)", min_value=1, max_value=16, value=4, step=1)
-
     if imgs_count and st.button("🚀 عدّ البطاقات والبحث"):
         client = setup_google_vision()
         if client is None:
             st.error("❌ خطأ في إعداد Google Vision.")
         else:
-            # --------- OCR سريع على دفعات ----------
-            with st.spinner("⏳ جاري استخراج الأرقام من الصور..."):
-                ocr_results = ocr_images_fast(client, imgs_count, batch_size=int(bs), max_workers=int(workers))
-
             all_numbers, number_to_files, details = [], {}, []
-            for fname, full_text in ocr_results:
-                found_numbers = re.findall(r"\b\d{8}\b", full_text or "")
-                for n in found_numbers:
-                    all_numbers.append(n)
-                    number_to_files.setdefault(n, set()).add(fname)
-                details.append({
-                    "اسم الملف": fname,
-                    "عدد البطاقات (أرقام 8 خانات)": len(found_numbers),
-                    "الأرقام المكتشفة (أرقام 8 خانات فقط)": ", ".join(found_numbers) if found_numbers else "لا يوجد"
-                })
+
+            for img in imgs_count:
+                try:
+                    content = img.read()
+                    image = vision.Image(content=content)
+                    response = client.text_detection(image=image)
+                    texts = response.text_annotations
+                    full_text = texts[0].description if texts else ""
+
+                    # استخراج أرقام مكونة من 8 خانات فقط
+                    found_numbers = re.findall(r"\b\d{8}\b", full_text)
+                    for n in found_numbers:
+                        all_numbers.append(n)
+                        number_to_files.setdefault(n, set()).add(img.name)
+
+                    details.append({
+                        "اسم الملف": img.name,
+                        "عدد البطاقات (أرقام 8 خانات)": len(found_numbers),
+                        "الأرقام المكتشفة (أرقام 8 خانات فقط)": ", ".join(found_numbers) if found_numbers else "لا يوجد"
+                    })
+
+                except Exception as e:
+                    st.warning(f"⚠️ خطأ أثناء معالجة صورة {img.name}: {e}")
 
             total_cards = len(all_numbers)
             unique_numbers = sorted(list(set(all_numbers)))
@@ -401,8 +403,16 @@ with tab_count:
             missing_list = []
             if unique_numbers:
                 try:
-                    with st.spinner("🔎 جاري مطابقة الأرقام مع قاعدة البيانات..."):
-                        found_df = fetch_voters_fast(unique_numbers)
+                    conn = get_conn()
+                    placeholders = ",".join(["%s"] * len(unique_numbers))
+                    query = f"""
+                        SELECT "رقم الناخب","الاسم الثلاثي","الجنس","هاتف","رقم العائلة",
+                               "اسم مركز الاقتراع","رقم مركز الاقتراع",
+                               "المدينة","رقم مركز التسجيل","اسم مركز التسجيل","تاريخ الميلاد"
+                        FROM "Bagdad" WHERE "رقم الناخب" IN ({placeholders})
+                    """
+                    found_df = pd.read_sql_query(query, conn, params=unique_numbers)
+                    conn.close()
 
                     if not found_df.empty:
                         found_df = found_df.rename(columns={
@@ -420,12 +430,13 @@ with tab_count:
                         })
                         found_df["الجنس"] = found_df["الجنس"].apply(map_gender)
 
-                        # 🧩 نفس أعمدة تبويب الملف
+                        # 🧩 إضافة نفس الأعمدة مثل تبويب 📂 رفع ملف Excel
                         found_df["رقم المندوب الرئيسي"] = ""
                         found_df["الحالة"] = 0
                         found_df["ملاحظة"] = ""
                         found_df["رقم المحطة"] = 1
 
+                        # ترتيب الأعمدة
                         found_df = found_df[[
                             "رقم الناخب","الاسم","الجنس","رقم الهاتف",
                             "رقم العائلة","مركز الاقتراع","رقم مركز الاقتراع","رقم المحطة",
@@ -437,6 +448,7 @@ with tab_count:
                         if n not in found_numbers_in_db:
                             files = sorted(list(number_to_files.get(n, [])))
                             missing_list.append({"رقم_الناخب": n, "المصدر(الصور)": ", ".join(files)})
+
                 except Exception as e:
                     st.error(f"❌ خطأ أثناء البحث في قاعدة البيانات: {e}")
             else:
@@ -446,7 +458,7 @@ with tab_count:
             st.markdown("### 📊 ملخص الاستخراج")
             c1, c2, c3 = st.columns(3)
             c1.metric("إجمالي الأرقام (مع التكرار)", total_cards)
-            c2.metric("إجمالي الأرقام الفريدة (8 خانات)", len(unique_numbers))
+            c2.metric("إجمالي الأرقام الفريدة (أرقام 8 خانات)", len(unique_numbers))
             c3.metric("عدد الصور المرفوعة", len(imgs_count))
 
             st.markdown("### 🔎 بيانات الناخبين (الموجودة في قاعدة البيانات)")
@@ -455,8 +467,7 @@ with tab_count:
                 out_found = "بيانات_الناخبين_الموجودين.xlsx"
                 found_df.to_excel(out_found, index=False, engine="openpyxl")
                 wb = load_workbook(out_found)
-                ws = wb.active
-                ws.sheet_view.rightToLeft = True
+                wb.active.sheet_view.rightToLeft = True
                 wb.save(out_found)
                 with open(out_found, "rb") as f:
                     st.download_button("⬇️ تحميل بيانات الناخبين الموجودة", f,
@@ -468,7 +479,7 @@ with tab_count:
             st.markdown("### ❌ الأرقام غير الموجودة في القاعدة (مع اسم الصورة)")
             if missing_list:
                 missing_df = pd.DataFrame(missing_list)
-                st.dataframe(missing_df, use_container_width=True, height=350)
+                st.dataframe(missing_df, use_container_width=True)
                 miss_file = "missing_numbers_with_files.xlsx"
                 missing_df.to_excel(miss_file, index=False, engine="openpyxl")
                 with open(miss_file, "rb") as f:
@@ -476,5 +487,4 @@ with tab_count:
                         file_name="الأرقام_غير_الموجودة_مع_المصدر.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
-                if unique_numbers:  # فقط إذا كان هناك أرقام مستخرجة أصلاً
-                    st.success("✅ لا توجد أرقام مفقودة (كل الأرقام الموجودة تم إيجادها في قاعدة البيانات).")
+                st.success("✅ لا توجد أرقام مفقودة (كل الأرقام الموجودة تم إيجادها في قاعدة البيانات).")
