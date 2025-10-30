@@ -413,7 +413,7 @@ with tab_count:
                         SELECT "رقم الناخب","الاسم الثلاثي","الجنس","هاتف","رقم العائلة",
                                "اسم مركز الاقتراع","رقم مركز الاقتراع",
                                "المدينة","رقم مركز التسجيل","اسم مركز التسجيل","تاريخ الميلاد"
-                        FROM "Bagdad" WHERE "رقم الناخب" IN ({placeholders})
+                        FROM "karkook" WHERE "رقم الناخب" IN ({placeholders})
                     """
                     df_part = pd.read_sql_query(query, conn, params=chunk)
                     frames.append(df_part)
