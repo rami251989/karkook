@@ -13,7 +13,6 @@ import numpy as np
 from PIL import Image
 import io
 import tempfile
-import arabic_reshaper
 from bidi.algorithm import get_display
 
 
