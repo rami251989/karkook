@@ -353,215 +353,6 @@ with tab_file:
 # ----------------------------------------------------------------------------- #
 # 3) 📦 عدّ البطاقات (OCR دفعات) + بحث سريع + قائمة الأرقام غير الموجودة
 # ----------------------------------------------------------------------------- #
-# -*- coding: utf-8 -*-
-# Streamlit page: OCR أرقام 8 خانات + بحث قاعدة البيانات + قائمة غير الموجودة
-# المتطلبات: streamlit, google-cloud-vision, sqlalchemy, psycopg2-binary, pandas, openpyxl
-
-import os
-import re
-import time
-import json
-import pandas as pd
-import streamlit as st
-from io import BytesIO
-
-# Google Vision
-from google.cloud import vision
-from google.oauth2 import service_account
-
-# Excel
-from openpyxl import load_workbook
-
-# SQLAlchemy (PostgreSQL via psycopg2)
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
-
-# =========================
-# 🔐 الإعدادات (من secrets)
-# =========================
-# يُفضّل وضع هذه القيم في .streamlit/secrets.toml بالشكل التالي:
-# [general]
-# DB_HOST = "db-postgresql-fra1-....ondigitalocean.com"
-# DB_PORT = 25060
-# DB_NAME = "defaultdb"
-# DB_USER = "doadmin"
-# DB_PASS = "YOUR_DB_PASSWORD"
-#
-# GOOGLE_APPLICATION_CREDENTIALS_JSON = """
-# { ... محتوى JSON لمستخدم الخدمة من Google ... }
-# """
-
-DB_HOST = st.secrets.get("DB_HOST", "db-postgresql-fra1-43509-do-user-11749150-0.d.db.ondigitalocean.com")
-DB_PORT = int(st.secrets.get("DB_PORT", 25060))
-DB_NAME = st.secrets.get("DB_NAME", "defaultdb")
-DB_USER = st.secrets.get("DB_USER", "doadmin")
-DB_PASS = st.secrets.get("DB_PASS", "YOUR_PASSWORD_HERE")   # غيّرها في secrets
-
-GOOGLE_SA_JSON = st.secrets.get("GOOGLE_APPLICATION_CREDENTIALS_JSON", None)
-
-# ==================================
-# ✅ تهيئة Google Vision (مع كاش)
-# ==================================
-@st.cache_resource(show_spinner=False)
-def setup_google_vision():
-    """
-    يهيّئ عميل Google Vision. يُفضّل تمرير JSON خدمة من st.secrets.
-    """
-    try:
-        if GOOGLE_SA_JSON:
-            # من secrets كـ JSON
-            if isinstance(GOOGLE_SA_JSON, str):
-                info = json.loads(GOOGLE_SA_JSON)
-            else:
-                info = GOOGLE_SA_JSON
-            creds = service_account.Credentials.from_service_account_info(info)
-            client = vision.ImageAnnotatorClient(credentials=creds)
-        else:
-            # الاعتماد على GOOGLE_APPLICATION_CREDENTIALS في البيئة
-            client = vision.ImageAnnotatorClient()
-        return client
-    except Exception as e:
-        st.error(f"❌ خطأ في تهيئة Google Vision: {e}")
-        return None
-
-# ===========================================
-# 🧠 دالة تحويل الجنس (حسب تنسيق قاعدة بياناتك)
-# ===========================================
-def map_gender(x):
-    if x is None:
-        return ""
-    s = str(x).strip()
-    if s in ["M", "m", "ذكر", "Male", "male", "1"]:
-        return "ذكر"
-    if s in ["F", "f", "أنثى", "Female", "female", "2"]:
-        return "أنثى"
-    return s  # كما هو إن لم يطابق
-
-# ===============================================
-# 🗄️ محرّك قاعدة البيانات مع Pooling و SSL و Retry
-# ===============================================
-@st.cache_resource(show_spinner=False)
-def get_engine():
-    """
-    PostgreSQL عبر SQLAlchemy + psycopg2
-    - SSL إلزامي على DigitalOcean (sslmode=require)
-    - connect_timeout صغير لعدم الانتظار الطويل
-    - keepalive لمنع موت الاتصال
-    - pool_pre_ping لمنع استخدام اتصال ميت
-    """
-    params = (
-        f"sslmode=require&connect_timeout=5"
-        f"&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
-    )
-    url = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}?{params}"
-    engine = create_engine(
-        url,
-        pool_size=5,
-        max_overflow=5,
-        pool_pre_ping=True,
-        pool_recycle=1800,
-    )
-    return engine
-
-def _query_with_retry(query: str, params: dict, tries: int = 3, delay: float = 1.5):
-    """
-    تنفيذ استعلام مع إعادة المحاولة على أخطاء الشبكة/الاتصال.
-    """
-    engine = get_engine()
-    last_err = None
-    for attempt in range(1, tries + 1):
-        try:
-            with engine.connect() as conn:
-                return pd.read_sql_query(text(query), conn, params=params)
-        except OperationalError as e:
-            last_err = e
-            time.sleep(delay * attempt)  # backoff بسيط
-        except SQLAlchemyError as e:
-            # أخطاء SQL أخرى: أوقف وأظهر الخطأ
-            raise e
-    raise last_err if last_err else RuntimeError("فشل الاستعلام بعد إعادة المحاولة.")
-
-def fetch_voters_fast(unique_numbers, chunk_size: int = 500):
-    """
-    يجلب السجلات على دفعات لتجنّب IN الضخم.
-    يستخدم CTE VALUES للربط عبر JOIN وهو أسرع/أكثر استقرارًا في كثير من الحالات.
-    """
-    if not unique_numbers:
-        return pd.DataFrame()
-
-    all_chunks = []
-    for i in range(0, len(unique_numbers), chunk_size):
-        chunk = [str(x) for x in unique_numbers[i:i+chunk_size]]
-        # نبني VALUES (:n0),(:n1)...
-        values_clause = ",".join([f"(:n{j})" for j in range(len(chunk))])
-        bind_params = {f"n{j}": chunk[j] for j in range(len(chunk))}
-
-        query = f"""
-        WITH input(n) AS (
-            VALUES {values_clause}
-        )
-        SELECT
-            "رقم الناخب","الاسم الثلاثي","الجنس","هاتف","رقم العائلة",
-            "اسم مركز الاقتراع","رقم مركز الاقتراع",
-            "المدينة","رقم مركز التسجيل","اسم مركز التسجيل","تاريخ الميلاد"
-        FROM "Bagdad" t
-        INNER JOIN input i ON t."رقم الناخب" = i.n
-        """
-
-        df_part = _query_with_retry(query, bind_params)
-        all_chunks.append(df_part)
-
-    if not all_chunks:
-        return pd.DataFrame()
-    return pd.concat(all_chunks, ignore_index=True)
-
-# =====================================
-# 🧾 OCR: استخراج أرقام 8 خانات من صور
-# =====================================
-def extract_numbers_from_images(client, uploaded_files):
-    """
-    يأخذ قائمة UploadedFile من Streamlit، يعيد:
-    - all_numbers: كل الأرقام مع التكرار
-    - number_to_files: mapping رقم -> أسماء الملفات التي ظهر فيها
-    - details: ملخّص لكل ملف
-    """
-    all_numbers, number_to_files, details = [], {}, []
-
-    for img in uploaded_files:
-        try:
-            content = img.read()
-            image = vision.Image(content=content)
-            response = client.text_detection(image=image)
-            texts = response.text_annotations
-            full_text = texts[0].description if texts else ""
-
-            # أرقام من 8 خانات فقط
-            found_numbers = re.findall(r"\b\d{8}\b", full_text)
-            for n in found_numbers:
-                n_str = str(n)
-                all_numbers.append(n_str)
-                number_to_files.setdefault(n_str, set()).add(img.name)
-
-            details.append({
-                "اسم الملف": img.name,
-                "عدد البطاقات (أرقام 8 خانات)": len(found_numbers),
-                "الأرقام المكتشفة (أرقام 8 خانات فقط)": ", ".join(found_numbers) if found_numbers else "لا يوجد"
-            })
-
-        except Exception as e:
-            st.warning(f"⚠️ خطأ أثناء معالجة صورة {img.name}: {e}")
-
-    return all_numbers, number_to_files, details
-
-# ==================
-# 🖥️ واجهة Streamlit
-# ==================
-st.set_page_config(page_title="عدّ البطاقات + مطابقة القاعدة", layout="wide")
-
-st.title("📦 عدّ البطاقات (OCR) + بحث سريع + قائمة الأرقام غير الموجودة")
-
-# لو عندك تبويبات في تطبيقك الأساسي، استبدل هذا بما يناسبك
-tab_count, = st.tabs(["عدّ البطاقات"])
 with tab_count:
     st.subheader("📦 عدّ البطاقات (أرقام 8 خانات) — بحث في القاعدة + الأرقام غير الموجودة")
 
@@ -577,9 +368,30 @@ with tab_count:
         if client is None:
             st.error("❌ خطأ في إعداد Google Vision.")
         else:
-            # --------- OCR ----------
-            with st.spinner("⏳ جاري استخراج الأرقام من الصور..."):
-                all_numbers, number_to_files, details = extract_numbers_from_images(client, imgs_count)
+            all_numbers, number_to_files, details = [], {}, []
+
+            for img in imgs_count:
+                try:
+                    content = img.read()
+                    image = vision.Image(content=content)
+                    response = client.text_detection(image=image)
+                    texts = response.text_annotations
+                    full_text = texts[0].description if texts else ""
+
+                    # استخراج أرقام مكونة من 8 خانات فقط
+                    found_numbers = re.findall(r"\b\d{8}\b", full_text)
+                    for n in found_numbers:
+                        all_numbers.append(n)
+                        number_to_files.setdefault(n, set()).add(img.name)
+
+                    details.append({
+                        "اسم الملف": img.name,
+                        "عدد البطاقات (أرقام 8 خانات)": len(found_numbers),
+                        "الأرقام المكتشفة (أرقام 8 خانات فقط)": ", ".join(found_numbers) if found_numbers else "لا يوجد"
+                    })
+
+                except Exception as e:
+                    st.warning(f"⚠️ خطأ أثناء معالجة صورة {img.name}: {e}")
 
             total_cards = len(all_numbers)
             unique_numbers = sorted(list(set(all_numbers)))
@@ -589,58 +401,56 @@ with tab_count:
             # ----------------- بحث في قاعدة البيانات عن الأرقام الموجودة -----------------
             found_df = pd.DataFrame()
             missing_list = []
-            db_ok = True
-
             if unique_numbers:
                 try:
-                    with st.spinner("🔎 جاري مطابقة الأرقام مع قاعدة البيانات..."):
-                        # عدّل chunk_size لو عندك آلاف الأرقام
-                        found_df = fetch_voters_fast(unique_numbers, chunk_size=500)
+                    conn = get_conn()
+                    placeholders = ",".join(["%s"] * len(unique_numbers))
+                    query = f"""
+                        SELECT "رقم الناخب","الاسم الثلاثي","الجنس","هاتف","رقم العائلة",
+                               "اسم مركز الاقتراع","رقم مركز الاقتراع",
+                               "المدينة","رقم مركز التسجيل","اسم مركز التسجيل","تاريخ الميلاد"
+                        FROM "Bagdad" WHERE "رقم الناخب" IN ({placeholders})
+                    """
+                    found_df = pd.read_sql_query(query, conn, params=unique_numbers)
+                    conn.close()
+
+                    if not found_df.empty:
+                        found_df = found_df.rename(columns={
+                            "رقم الناخب": "رقم الناخب",
+                            "الاسم الثلاثي": "الاسم",
+                            "الجنس": "الجنس",
+                            "هاتف": "رقم الهاتف",
+                            "رقم العائلة": "رقم العائلة",
+                            "اسم مركز الاقتراع": "مركز الاقتراع",
+                            "رقم مركز الاقتراع": "رقم مركز الاقتراع",
+                            "المدينة": "المدينة",
+                            "رقم مركز التسجيل": "رقم مركز التسجيل",
+                            "اسم مركز التسجيل": "اسم مركز التسجيل",
+                            "تاريخ الميلاد": "تاريخ الميلاد"
+                        })
+                        found_df["الجنس"] = found_df["الجنس"].apply(map_gender)
+
+                        # 🧩 إضافة نفس الأعمدة مثل تبويب 📂 رفع ملف Excel
+                        found_df["رقم المندوب الرئيسي"] = ""
+                        found_df["الحالة"] = 0
+                        found_df["ملاحظة"] = ""
+                        found_df["رقم المحطة"] = 1
+
+                        # ترتيب الأعمدة
+                        found_df = found_df[[
+                            "رقم الناخب","الاسم","الجنس","رقم الهاتف",
+                            "رقم العائلة","مركز الاقتراع","رقم مركز الاقتراع","رقم المحطة",
+                            "رقم المندوب الرئيسي","الحالة","ملاحظة"
+                        ]]
+
+                    found_numbers_in_db = set(found_df["رقم الناخب"].astype(str).tolist()) if not found_df.empty else set()
+                    for n in unique_numbers:
+                        if n not in found_numbers_in_db:
+                            files = sorted(list(number_to_files.get(n, [])))
+                            missing_list.append({"رقم_الناخب": n, "المصدر(الصور)": ", ".join(files)})
 
                 except Exception as e:
-                    db_ok = False
-                    st.error(
-                        "❌ تعذر الاتصال بقاعدة البيانات حاليًا (Timeout/Network). "
-                        "سيتم عرض نتائج OCR فقط وقائمة الأرقام غير الموجودة بناءً على الصور."
-                    )
-                    st.caption(f"تفاصيل فنية: {e}")
-
-                if db_ok and not found_df.empty:
-                    found_df = found_df.rename(columns={
-                        "رقم الناخب": "رقم الناخب",
-                        "الاسم الثلاثي": "الاسم",
-                        "الجنس": "الجنس",
-                        "هاتف": "رقم الهاتف",
-                        "رقم العائلة": "رقم العائلة",
-                        "اسم مركز الاقتراع": "مركز الاقتراع",
-                        "رقم مركز الاقتراع": "رقم مركز الاقتراع",
-                        "المدينة": "المدينة",
-                        "رقم مركز التسجيل": "رقم مركز التسجيل",
-                        "اسم مركز التسجيل": "اسم مركز التسجيل",
-                        "تاريخ الميلاد": "تاريخ الميلاد"
-                    })
-                    found_df["الجنس"] = found_df["الجنس"].apply(map_gender)
-
-                    # 🧩 أعمدة إضافية للتوافق مع تبويب رفع الملف
-                    found_df["رقم المندوب الرئيسي"] = ""
-                    found_df["الحالة"] = 0
-                    found_df["ملاحظة"] = ""
-                    found_df["رقم المحطة"] = 1
-
-                    # ترتيب الأعمدة
-                    found_df = found_df[[
-                        "رقم الناخب","الاسم","الجنس","رقم الهاتف",
-                        "رقم العائلة","مركز الاقتراع","رقم مركز الاقتراع","رقم المحطة",
-                        "رقم المندوب الرئيسي","الحالة","ملاحظة"
-                    ]]
-
-                # حساب غير الموجودة
-                found_numbers_in_db = set(found_df["رقم الناخب"].astype(str).tolist()) if (db_ok and not found_df.empty) else set()
-                for n in unique_numbers:
-                    if (not db_ok) or (n not in found_numbers_in_db):
-                        files = sorted(list(number_to_files.get(n, [])))
-                        missing_list.append({"رقم_الناخب": n, "المصدر(الصور)": ", ".join(files)})
-
+                    st.error(f"❌ خطأ أثناء البحث في قاعدة البيانات: {e}")
             else:
                 st.info("ℹ️ لم يتم العثور على أي أرقام مكوّنة من 8 خانات في الصور المرفوعة.")
 
@@ -651,49 +461,30 @@ with tab_count:
             c2.metric("إجمالي الأرقام الفريدة (8 خانات)", len(unique_numbers))
             c3.metric("عدد الصور المرفوعة", len(imgs_count))
 
-            # تفاصيل كل ملف (اختياري للعرض)
-            with st.expander("🧾 تفاصيل استخراج كل صورة"):
-                if details:
-                    details_df = pd.DataFrame(details)
-                    st.dataframe(details_df, use_container_width=True)
-                else:
-                    st.write("لا تفاصيل.")
-
             st.markdown("### 🔎 بيانات الناخبين (الموجودة في قاعدة البيانات)")
             if not found_df.empty:
                 st.dataframe(found_df, use_container_width=True, height=400)
                 out_found = "بيانات_الناخبين_الموجودين.xlsx"
                 found_df.to_excel(out_found, index=False, engine="openpyxl")
-
-                # RTL
                 wb = load_workbook(out_found)
                 wb.active.sheet_view.rightToLeft = True
                 wb.save(out_found)
-
                 with open(out_found, "rb") as f:
-                    st.download_button(
-                        "⬇️ تحميل بيانات الناخبين الموجودة",
-                        f,
+                    st.download_button("⬇️ تحميل بيانات الناخبين الموجودة", f,
                         file_name="بيانات_الناخبين_الموجودين.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
                 st.warning("⚠️ لم يتم العثور على أي مطابقات في القاعدة.")
 
             st.markdown("### ❌ الأرقام غير الموجودة في القاعدة (مع اسم الصورة)")
             if missing_list:
                 missing_df = pd.DataFrame(missing_list)
-                st.dataframe(missing_df, use_container_width=True, height=350)
-
+                st.dataframe(missing_df, use_container_width=True)
                 miss_file = "missing_numbers_with_files.xlsx"
                 missing_df.to_excel(miss_file, index=False, engine="openpyxl")
                 with open(miss_file, "rb") as f:
-                    st.download_button(
-                        "⬇️ تحميل الأرقام غير الموجودة مع المصدر",
-                        f,
+                    st.download_button("⬇️ تحميل الأرقام غير الموجودة مع المصدر", f,
                         file_name="الأرقام_غير_الموجودة_مع_المصدر.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
-                if unique_numbers:
-                    st.success("✅ لا توجد أرقام مفقودة (كل الأرقام الموجودة تم إيجادها في قاعدة البيانات).")
+                st.success("✅ لا توجد أرقام مفقودة (كل الأرقام الموجودة تم إيجادها في قاعدة البيانات).")
