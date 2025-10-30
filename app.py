@@ -12,8 +12,6 @@ import cv2
 import numpy as np
 from PIL import Image
 import io
-from reportlab.pdfbase.ttfonts import TTFont
-import qrcode
 import tempfile
 import arabic_reshaper
 from bidi.algorithm import get_display
